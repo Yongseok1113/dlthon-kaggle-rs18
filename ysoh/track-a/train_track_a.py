@@ -132,6 +132,8 @@ def evaluate(model, loader, criterion):
     total_loss = 0.0
     correct = 0
     n = 0
+    all_labels = []
+    all_probs = []
     for imgs, labels, weights in loader:
         imgs, labels, weights = imgs.to(DEVICE), labels.to(DEVICE), weights.to(DEVICE)
         outputs = model(imgs)
@@ -141,7 +143,21 @@ def evaluate(model, loader, criterion):
         preds = outputs.argmax(dim=1)
         correct += (preds == labels).sum().item()
         n += imgs.size(0)
-    return total_loss / n, correct / n
+
+        probs = torch.softmax(outputs, dim=1)[:, 1]  # class 1 = Dusty 확률
+        all_labels.extend(labels.cpu().numpy())
+        all_probs.extend(probs.cpu().numpy())
+
+    # 실제 대회 평가지표가 ROC-AUC이므로, val_acc(0.5 임계값 기준 정확도)보다
+    # val_auc를 베스트 모델 선택 기준으로 사용하는 것이 더 정확함.
+    from sklearn.metrics import roc_auc_score
+    try:
+        auc = roc_auc_score(all_labels, all_probs)
+    except ValueError:
+        # validation fold에 한쪽 클래스만 있는 등 AUC 계산 불가 상황 대비
+        auc = float("nan")
+
+    return total_loss / n, correct / n, auc
 
 
 def main(args):
@@ -192,19 +208,31 @@ def main(args):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(reduction="none")  # reduction="none" -> 샘플별 가중치 적용 위해
 
-    best_val_acc = 0.0
+    best_val_auc = -1.0
+    epochs_without_improvement = 0
     for epoch in range(args.epochs):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion)
-        val_loss, val_acc = evaluate(model, val_loader, criterion)
+        val_loss, val_acc, val_auc = evaluate(model, val_loader, criterion)
         print(f"[epoch {epoch + 1}/{args.epochs}] "
-              f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  val_acc={val_acc:.4f}")
+              f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+              f"val_acc={val_acc:.4f}  val_auc={val_auc:.4f}")
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # 실제 대회 평가지표(ROC-AUC)에 맞춰 베스트 모델을 선택.
+        # val_acc(0.5 임계값 정확도)는 AUC와 다른 지표라 베스트 선택 기준으로
+        # 부적절할 수 있음(실측: val_acc는 계속 올랐지만 val_loss는 과적합으로
+        # 악화되는 구간에서 베스트가 선택되어, 실제 제출 점수가 하락한 사례 확인).
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            epochs_without_improvement = 0
             torch.save(model.state_dict(), args.out_model)
-            print(f"  -> 베스트 모델 갱신, 저장: {args.out_model}")
+            print(f"  -> 베스트 모델 갱신(val_auc 기준), 저장: {args.out_model}")
+        else:
+            epochs_without_improvement += 1
+            if args.patience > 0 and epochs_without_improvement >= args.patience:
+                print(f"\n  {args.patience} epoch 연속 val_auc 개선 없음 -> early stopping")
+                break
 
-    print(f"\n학습 완료. 베스트 val_acc={best_val_acc:.4f}")
+    print(f"\n학습 완료. 베스트 val_auc={best_val_auc:.4f}")
 
 
 if __name__ == "__main__":
@@ -216,7 +244,11 @@ if __name__ == "__main__":
     parser.add_argument("--arch", default="efficientnet_b0",
                          choices=["resnet18", "efficientnet_b0"],
                          help="사용할 모델 아키텍처 (기본: efficientnet_b0)")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=20,
+                         help="최대 epoch 수 (early stopping으로 보통 더 일찍 끝남)")
+    parser.add_argument("--patience", type=int, default=3,
+                         help="val_auc가 이 횟수만큼 연속으로 개선되지 않으면 조기 종료. "
+                              "0이면 early stopping 비활성화")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--val_ratio", type=float, default=0.15)
