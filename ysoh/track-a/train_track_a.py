@@ -27,11 +27,37 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models
+from torchvision import models, transforms as T
 from sklearn.model_selection import train_test_split
 from PIL import Image
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def build_augmentation(base_transform, rotation_degrees=12, hflip_p=0.5):
+    """
+    base_transform(EfficientNet/ResNet의 표준 전처리 transform) 앞단에
+    학습용 증강을 끼워넣은 transform을 반환.
+
+    - 수평 뒤집기(hflip): 패널이 보통 좌우 대칭적인 구도라 자연스러운 증강
+    - 10~15도 범위의 무작위 회전: 약간 기울어진 촬영 각도를 흉내냄
+      (너무 큰 회전은 패널 격자 패턴이 비정상적으로 보일 수 있어 범위를 제한)
+
+    base_transform 자체가 Resize+CenterCrop+ToTensor+Normalize를 포함하는
+    경우(torchvision의 weights.transforms())가 많아, 증강은 PIL 이미지
+    단계에서 먼저 적용한 뒤 base_transform을 그대로 이어붙이는 구조로 작성.
+    """
+    augment = T.Compose([
+        T.RandomHorizontalFlip(p=hflip_p),
+        T.RandomRotation(degrees=rotation_degrees),
+    ])
+
+    class AugmentedTransform:
+        def __call__(self, img):
+            img = augment(img)
+            return base_transform(img)
+
+    return AugmentedTransform()
 
 
 class PanelDataset(Dataset):
@@ -149,8 +175,17 @@ def main(args):
     print(f"모델 아키텍처: {args.arch}")
     model = model.to(DEVICE)
 
-    train_ds = PanelDataset(train_df, args.train_dir, transform)
-    val_ds = PanelDataset(val_df, args.train_dir, transform)
+    if args.augment:
+        train_transform = build_augmentation(
+            transform, rotation_degrees=args.rotation_degrees, hflip_p=args.hflip_prob
+        )
+        print(f"학습 데이터 증강 적용: 수평뒤집기(p={args.hflip_prob}), "
+              f"무작위회전(±{args.rotation_degrees}도)")
+    else:
+        train_transform = transform
+
+    train_ds = PanelDataset(train_df, args.train_dir, train_transform)
+    val_ds = PanelDataset(val_df, args.train_dir, transform)  # val은 증강 없이 원본 그대로
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
@@ -186,5 +221,13 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--val_ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--augment", action="store_true", default=True,
+                         help="학습 데이터에 수평뒤집기+회전 증강 적용 (기본 활성화)")
+    parser.add_argument("--no_augment", dest="augment", action="store_false",
+                         help="증강을 끄고 원본 이미지만 사용")
+    parser.add_argument("--rotation_degrees", type=float, default=12,
+                         help="무작위 회전 범위(±도), 기본 12도 (10~15도 권장 범위 중간값)")
+    parser.add_argument("--hflip_prob", type=float, default=0.5,
+                         help="수평 뒤집기 적용 확률, 기본 0.5")
     args = parser.parse_args()
     main(args)
