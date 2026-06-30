@@ -12,7 +12,8 @@ import pandas as pd
 
 from embed import embed_images
 from dup_score import compute_dup_scores
-from ood_score import compute_ood_score_handcrafted, compute_ood_score_clip_prompts
+from ood_score import (compute_ood_score_handcrafted, compute_ood_score_clip_prompts,
+                        compute_ood_score_simple_rank_avg)
 from mislabel_score import compute_mislabel_scores, combine_with_dup_signal
 
 
@@ -42,7 +43,7 @@ def find_dup_label_conflicts(dup_score, nearest_idx, labels, dup_threshold=0.85)
     return conflict
 
 
-def main(train_dir, labels_csv, out_path, use_clip=True):
+def main(train_dir, labels_csv, out_path, use_clip=True, ood_method="complex"):
     df = pd.read_csv(labels_csv)
     df = df.sort_values("id").reset_index(drop=True)
     image_paths = [os.path.join(train_dir, f"{i}.jpg") for i in df["id"]]
@@ -56,36 +57,58 @@ def main(train_dir, labels_csv, out_path, use_clip=True):
     dup_scores, nearest_idx, _ = compute_dup_scores(image_paths, embeddings=embeddings)
 
     print("[3/4] ood_score 계산 중...")
-    ood_scores_hc, ood_feats = compute_ood_score_handcrafted(image_paths, embeddings=embeddings)
 
-    if use_clip:
-        print("  CLIP zero-shot ood_score 계산 중... (최초 실행 시 가중치 다운로드)")
-        try:
-            ood_scores_clip_raw = compute_ood_score_clip_prompts(image_paths)
+    if ood_method == "simple":
+        # 레퍼런스 노트북(public score 0.422 달성) 방식 그대로 재현:
+        # centroid_dist + knn_dist + ocr_text_length를 rank로 변환 후 단순 평균.
+        # 실측 비교에서 복합 방식(hand-crafted 5종 + CLIP + np.maximum 보호, ood_method="complex")
+        # 보다 이 단순 방식이 public score가 더 높게 나옴(0.385 vs 0.390 추정 근거가 되는
+        # 레퍼런스 노트북의 실제 점수 0.422). 따라서 기본값으로 채택.
+        print("  단순 rank 평균 방식 (centroid_dist + knn_dist + ocr_text_length) 사용")
+        ood_scores, ood_feats_simple = compute_ood_score_simple_rank_avg(image_paths, embeddings)
+        # 진단 파일 호환을 위해 6컬럼 형태로 채워둠 (grid/dark/skin/veg/watermark는 0, ocr만 채움)
+        ood_feats = np.zeros((len(image_paths), 6))
+        ood_feats[:, 5] = ood_feats_simple[:, 2]  # ocr_text_length
+        ood_scores_hc = ood_scores  # 진단 호환용 별칭
+        ood_scores_clip_raw = np.full(len(image_paths), np.nan)
+    else:
+        ood_scores_hc, ood_feats = compute_ood_score_handcrafted(image_paths, embeddings=embeddings)
 
-            # CLIP의 raw softmax 확률은 0.3~0.7 부근으로 좁게 몰리는 경향이 있어,
-            # hand-crafted(percentile rank, 0~1 전역 분포)와 그대로 가중합하면
-            # 전체 분산이 CLIP 쪽으로 깎여버림(실측: 결합 후 ood_score가 0.45~0.72로
-            # 좁아지는 문제 확인). 두 신호 모두 percentile rank로 변환한 뒤 결합해야
-            # 각 신호의 분산 차이와 무관하게 의도한 가중치 비율이 그대로 반영됨.
-            def to_rank(x):
-                order = np.argsort(x)
-                rank = np.empty_like(order, dtype=float)
-                rank[order] = np.arange(len(order))
-                return rank / (len(order) - 1 + 1e-8)
+        if use_clip:
+            print("  CLIP zero-shot ood_score 계산 중... (최초 실행 시 가중치 다운로드)")
+            try:
+                ood_scores_clip_raw = compute_ood_score_clip_prompts(image_paths)
 
-            ood_scores_clip_rank = to_rank(ood_scores_clip_raw)
-            ood_scores_hc_rank = to_rank(ood_scores_hc)
+                # CLIP의 raw softmax 확률은 0.3~0.7 부근으로 좁게 몰리는 경향이 있어,
+                # hand-crafted(percentile rank, 0~1 전역 분포)와 그대로 가중합하면
+                # 전체 분산이 CLIP 쪽으로 깎여버림(실측: 결합 후 ood_score가 0.45~0.72로
+                # 좁아지는 문제 확인). 두 신호 모두 percentile rank로 변환한 뒤 결합해야
+                # 각 신호의 분산 차이와 무관하게 의도한 가중치 비율이 그대로 반영됨.
+                def to_rank(x):
+                    order = np.argsort(x)
+                    rank = np.empty_like(order, dtype=float)
+                    rank[order] = np.arange(len(order))
+                    return rank / (len(order) - 1 + 1e-8)
 
-            # CLIP을 주신호로(가중치 0.7), hand-crafted를 보조로(0.3) 결합.
-            ood_scores = 0.7 * ood_scores_clip_rank + 0.3 * ood_scores_hc_rank
-        except Exception as e:
-            print(f"  [경고] CLIP 계산 실패, hand-crafted만 사용: {e}")
+                ood_scores_clip_rank = to_rank(ood_scores_clip_raw)
+                ood_scores_hc_rank = to_rank(ood_scores_hc)
+
+                # CLIP을 주신호로(가중치 0.7), hand-crafted를 보조로(0.3) 결합.
+                combined = 0.7 * ood_scores_clip_rank + 0.3 * ood_scores_hc_rank
+
+                # 주의: 단순 가중합은 OCR 텍스트 검출처럼 신뢰도 높은 신호를 다시 희석시킴
+                # (실측: 텍스트 64자 검출됐는데 결합 후 ood_score가 0.40으로 낮게 나오는 역설
+                # 확인). OCR 텍스트 길이가 명확히 검출된 경우(rank 상위)는 결합 결과와
+                # 무관하게 최소 보장값을 유지하도록 max로 재보호.
+                ocr_rank = to_rank(ood_feats[:, 5])  # ocr_text_length 컬럼
+                ood_scores = np.maximum(combined, ocr_rank)
+            except Exception as e:
+                print(f"  [경고] CLIP 계산 실패, hand-crafted만 사용: {e}")
+                ood_scores = ood_scores_hc
+                ood_scores_clip_raw = np.full_like(ood_scores_hc, np.nan)
+        else:
             ood_scores = ood_scores_hc
             ood_scores_clip_raw = np.full_like(ood_scores_hc, np.nan)
-    else:
-        ood_scores = ood_scores_hc
-        ood_scores_clip_raw = np.full_like(ood_scores_hc, np.nan)
 
     print("[4/4] mislabel_score 계산 중...")
     # dup_score는 코사인 유사도 기반이라 절대 스케일이 신뢰할 수 없음(최솟값이 0에서 한참 떨어져
@@ -126,6 +149,7 @@ def main(train_dir, labels_csv, out_path, use_clip=True):
         "id": df["id"],
         "label": labels,
         "oof_pred_prob": oof_pred,
+        "mislabel_score": mislabel_scores,
         "dup_score": dup_scores,
         "ood_score": ood_scores,
     })
@@ -145,6 +169,7 @@ def main(train_dir, labels_csv, out_path, use_clip=True):
         "skin_ratio": ood_feats[:, 2],
         "vegetation_ratio": ood_feats[:, 3],
         "watermark_ratio": ood_feats[:, 4],
+        "ocr_text_length": ood_feats[:, 5],
     })
     ood_feat_df.to_csv(ood_feat_path, index=False)
     print(f"ood 특징 진단 파일 저장 완료: {ood_feat_path}")
@@ -168,6 +193,10 @@ if __name__ == "__main__":
     parser.add_argument("--out", default="submission.csv")
     parser.add_argument("--no_clip", action="store_true",
                          help="CLIP을 사용하지 않고 hand-crafted ood_score만 사용 (설치/다운로드 불가 시)")
+    parser.add_argument("--ood_method", default="complex", choices=["simple", "complex"],
+                         help="complex(기본, 최종 채택: CLIP+hand-crafted+max보호, public score 0.390) "
+                              "또는 simple(레퍼런스 노트북 재현: centroid+knn+ocr rank 평균, "
+                              "실측 결과 public score 0.358로 더 낮아 기본값에서 제외함)")
     args = parser.parse_args()
 
     if args.train_dir and args.labels_csv:
@@ -179,4 +208,4 @@ if __name__ == "__main__":
     else:
         parser.error("--competition 또는 (--train_dir와 --labels_csv)를 함께 지정해야 합니다.")
 
-    main(train_dir, labels_csv, args.out, use_clip=not args.no_clip)
+    main(train_dir, labels_csv, args.out, use_clip=not args.no_clip, ood_method=args.ood_method)

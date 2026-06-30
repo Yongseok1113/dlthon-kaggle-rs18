@@ -1,5 +1,14 @@
+# ysoh
 uv.lock
 pyproject.toml
 .python-version
 ysoh/datasets
+ysoh/*.zip
+ysoh/*.csv
+ysoh/*.png
+ysoh/*.jpg
+ysoh/bkp_results
 .venv
+ysoh/**/*.pyc
+ysoh/__pycache__/*
+ysoh/**/__pycache__

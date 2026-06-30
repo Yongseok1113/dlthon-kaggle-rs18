@@ -15,23 +15,26 @@ import matplotlib.pyplot as plt
 
 
 FEATURE_COLS = ["grid_regularity", "dark_blue_gray", "skin_ratio",
-                 "vegetation_ratio", "watermark_ratio"]
+                 "vegetation_ratio", "watermark_ratio", "ocr_text_length"]
 
 
 def diagnose(ood_features_path, out_path, top_n=20):
     df = pd.read_csv(ood_features_path)
 
     # 1) 각 특징의 분포 히스토그램
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    fig, axes = plt.subplots(2, 4, figsize=(19, 8))
     axes = axes.flatten()
     for ax, col in zip(axes, FEATURE_COLS):
         ax.hist(df[col], bins=40, color="steelblue", edgecolor="white")
         ax.set_title(col)
         ax.set_xlabel("value")
         ax.set_ylabel("count")
-    # 마지막 칸에 ood_score 자체도 표시
-    axes[5].hist(df["ood_score"], bins=40, color="salmon", edgecolor="white")
-    axes[5].set_title("ood_score (final)")
+    # 다음 칸에 ood_score 자체도 표시
+    axes[len(FEATURE_COLS)].hist(df["ood_score"], bins=40, color="salmon", edgecolor="white")
+    axes[len(FEATURE_COLS)].set_title("ood_score (final)")
+    # 남는 칸은 숨김
+    for ax in axes[len(FEATURE_COLS) + 1:]:
+        ax.axis("off")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -61,6 +64,21 @@ def diagnose(ood_features_path, out_path, top_n=20):
     print(f"\n=== watermark_ratio 단독 상위 {top_n}개 id (직접 이미지 확인용) ===")
     top_wm = df.nlargest(top_n, "watermark_ratio")
     print(top_wm[["id", "watermark_ratio", "ood_score"]].to_string(index=False))
+
+    # 5) OCR 텍스트가 검출된 이미지(ocr_text_length > 0)만 따로 확인
+    #    -> 대부분 0이라 일반 히스토그램으로는 분포가 안 보이므로 별도 점검
+    if "ocr_text_length" in df.columns:
+        ocr_positive = df[df["ocr_text_length"] > 0]
+        print(f"\n=== OCR 텍스트 검출된 이미지: {len(ocr_positive)} / {len(df)} "
+              f"({len(ocr_positive) / len(df) * 100:.1f}%) ===")
+        if len(ocr_positive) > 0:
+            print(f"  이 중 ood_score 평균: {ocr_positive['ood_score'].mean():.4f} "
+                  f"(전체 평균: {df['ood_score'].mean():.4f})")
+            print(ocr_positive.nlargest(min(top_n, len(ocr_positive)), "ocr_text_length")
+                  [["id", "ocr_text_length", "ood_score"]].to_string(index=False))
+        else:
+            print("  OCR로 텍스트가 검출된 이미지가 없습니다. "
+                  "tesseract 설치/경로를 확인하세요.")
 
 
 if __name__ == "__main__":

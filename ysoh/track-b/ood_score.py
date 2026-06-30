@@ -103,6 +103,25 @@ def green_vegetation_ratio(bgr):
     return float((mask > 0).mean())
 
 
+def ocr_text_length(path, max_side=512):
+    """
+    이미지에서 OCR로 텍스트를 추출해 길이를 반환.
+    워터마크/제품샷/인포그래픽 등 텍스트가 포함된 off-topic 이미지를
+    직접적으로 잡아내는 신호. 기존 MSER 기반 워터마크 근사(watermark_text_ratio)보다
+    훨씬 정확함(실측: MSER은 노이즈에 취약해 신호가 약했으나, 직접 OCR은
+    "shutterstock" 등 실제 텍스트를 명확히 검출함).
+    """
+    try:
+        import pytesseract
+        img = Image.open(path).convert("RGB")
+        img.thumbnail((max_side, max_side))
+        text = pytesseract.image_to_string(img)
+        return len(text.strip())
+    except Exception as e:
+        print(f"[경고] OCR 실패: {path} ({e})")
+        return 0
+
+
 def extract_ood_features(image_paths, verbose=True):
     feats = []
     n = len(image_paths)
@@ -115,14 +134,56 @@ def extract_ood_features(image_paths, verbose=True):
                 skin_color_ratio(bgr),
                 green_vegetation_ratio(bgr),
                 watermark_text_ratio(bgr),
+                ocr_text_length(p),
             ]
         except Exception as e:
             print(f"[경고] ood 특징 추출 실패: {p} ({e})")
-            f = [0.0, 0.0, 0.0, 0.0, 0.0]
+            f = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         feats.append(f)
         if verbose and i % 200 == 0:
             print(f"  ood feature {i}/{n}")
     return np.array(feats)
+
+
+def compute_ood_score_simple_rank_avg(image_paths, embeddings):
+    """
+    레퍼런스 노트북(0.422 달성) 방식을 그대로 재현.
+    centroid_dist(임베딩 평균에서 거리) + knn_dist(k=5 최근접 평균거리) +
+    ocr_text_length 세 가지를 각각 rank로 변환 후 단순 평균(/3).
+
+    기존 compute_ood_score_handcrafted()와의 핵심 차이:
+    - hand-crafted 보조 특징(grid/dark/skin/veg/watermark), CLIP을 전혀 쓰지 않음
+    - np.maximum 보호 로직 없이 순수 평균만 사용
+    - 신호 수를 3개로 최소화 -> 단순함이 오히려 안정적인 결과를 낼 수 있음
+      (실측: np.maximum 보호 2단계 + CLIP 결합 버전(v13)이 단순 버전보다
+      오히려 public score가 낮게 나옴 0.385 vs 0.390)
+
+    embeddings는 필수 인자(레퍼런스도 ResNet18 임베딩을 항상 사용).
+    """
+    from sklearn.neighbors import NearestNeighbors
+    from scipy.stats import rankdata
+
+    centroid = embeddings.mean(axis=0)
+    centroid_dist = np.linalg.norm(embeddings - centroid, axis=1)
+
+    k = 5
+    nn = NearestNeighbors(n_neighbors=k + 1).fit(embeddings)
+    dists, _ = nn.kneighbors(embeddings)
+    knn_dist = dists[:, 1:].mean(axis=1)
+
+    ocr_lengths = np.array([ocr_text_length(p) for p in image_paths])
+
+    centroid_rank = rankdata(centroid_dist)
+    knn_rank = rankdata(knn_dist)
+    text_rank = rankdata(ocr_lengths)
+
+    ood_score_raw = (centroid_rank + knn_rank + text_rank) / 3
+    # 0~1로 정규화 (레퍼런스는 정규화 없이 순위값 그대로 제출했으나,
+    # 본 대회 제출 형식이 0~1 점수를 요구하므로 min-max 정규화 적용)
+    ood_score = (ood_score_raw - ood_score_raw.min()) / (ood_score_raw.max() - ood_score_raw.min() + 1e-8)
+
+    feats = np.column_stack([centroid_dist, knn_dist, ocr_lengths])
+    return ood_score, feats
 
 
 def compute_ood_score_handcrafted(image_paths, embeddings=None):
@@ -148,10 +209,11 @@ def compute_ood_score_handcrafted(image_paths, embeddings=None):
     r_skin = to_rank(feats[:, 2])
     r_veg = to_rank(feats[:, 3])
     r_watermark = to_rank(feats[:, 4])
+    r_ocr_text = to_rank(feats[:, 5])
 
     # 패널다움 점수(0~1 스케일 rank들의 가중합): grid(+, 약하게), dark_blue_gray(+),
     # skin(-), vegetation(-).
-    # watermark는 선형결합에 포함시키지 않음 -> 다른 4개 신호(가중치 합 3.5)에 묻혀
+    # watermark/ocr_text는 선형결합에 포함시키지 않음 -> 다른 신호들에 묻혀
     # 거의 무영향이 되는 문제가 실측 진단(Spearman corr가 가장 낮은 축)으로 확인됨.
     panel_likeness = 0.5 * r_grid + r_dark - r_skin - r_veg
     order = np.argsort(panel_likeness)
@@ -159,10 +221,11 @@ def compute_ood_score_handcrafted(image_paths, embeddings=None):
     rank[order] = np.arange(len(order))
     base_ood_score = 1 - (rank / (len(order) - 1 + 1e-8))
 
-    # watermark는 별도 신호로 두고, 둘 중 더 강하게 의심되는 쪽(max)을 최종 점수로 사용.
-    # 워터마크 비율 상위 N%(워터마크 자체 rank가 매우 높은 경우)는 다른 신호와 무관하게
+    # watermark(MSER 근사)와 ocr_text(실제 OCR, 더 신뢰도 높음)는 모두 별도 신호로 두고,
+    # base/watermark/ocr_text 중 가장 강하게 의심되는 쪽(max)을 최종 점수로 사용.
+    # 텍스트가 명확히 검출되면(워터마크/제품샷/인포그래픽) 다른 신호와 무관하게
     # 강하게 ood로 의심되도록 보장.
-    ood_score = np.maximum(base_ood_score, r_watermark)
+    hc_ood_score = np.maximum(np.maximum(base_ood_score, r_watermark), r_ocr_text)
 
     if embeddings is not None:
         # 임베딩 기반 이상치 점수도 결합 (k-NN 평균거리, 작은 k로 지역밀도 근사)
@@ -176,7 +239,14 @@ def compute_ood_score_handcrafted(image_paths, embeddings=None):
         rank2[order2] = np.arange(len(order2))
         emb_ood_score = rank2 / (len(order2) - 1 + 1e-8)  # 거리가 클수록(=고립될수록) 높은 점수
 
-        ood_score = 0.5 * ood_score + 0.5 * emb_ood_score
+        # 주의: 0.5*hc + 0.5*emb로 단순 평균하면 np.maximum으로 보호했던 OCR/watermark
+        # 신호가 다시 희석되는 문제가 실측에서 확인됨(OCR 64자 검출됐는데 ood_score 0.40
+        # 같은 낮은 값이 나오는 역설 발생). watermark/ocr_text는 임베딩 결합 이후에도
+        # 보호되도록, 평균 낸 결과와 watermark/ocr_text 중 다시 max를 취함.
+        combined = 0.5 * hc_ood_score + 0.5 * emb_ood_score
+        ood_score = np.maximum(np.maximum(combined, r_watermark), r_ocr_text)
+    else:
+        ood_score = hc_ood_score
 
     return ood_score, feats
 
