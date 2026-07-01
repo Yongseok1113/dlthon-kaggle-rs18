@@ -12,3 +12,4 @@ ysoh/bkp_results
 ysoh/**/*.pyc
 ysoh/__pycache__/*
 ysoh/**/__pycache__
+ysoh/**/*.pt

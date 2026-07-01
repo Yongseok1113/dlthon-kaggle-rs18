@@ -251,6 +251,134 @@ def compute_ood_score_handcrafted(image_paths, embeddings=None):
     return ood_score, feats
 
 
+def compute_patch_variance_score(image_paths, classifier_model=None,
+                                  classifier_transform=None, device=None,
+                                  grid_n=3, batch_size=32, verbose=True):
+    """
+    혼합 이미지(50:50 콜라주, 청소 중 사진 등) 탐지.
+    이미지를 grid_n x grid_n 패치로 나눠 각 패치의 dusty_prob를 측정하고,
+    패치 간 표준편차(분산의 제곱근)를 반환.
+
+    - 값이 크면: 한 이미지 안에 Clean/Dusty가 혼재 (50:50 혼합 케이스)
+    - 값이 작으면: 이미지 전체가 일관되게 Clean 또는 Dusty
+
+    classifier_model: Track A에서 학습한 EfficientNet-B0(model.pt).
+        None이면 단순 밝기 분산으로 근사(폴백, 덜 정확함).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    scores = []
+    n = len(image_paths)
+
+    if classifier_model is not None:
+        classifier_model.eval()
+        for i, p in enumerate(image_paths):
+            try:
+                img = Image.open(p).convert("RGB")
+                w, h = img.size
+                pw, ph = w // grid_n, h // grid_n
+                patch_probs = []
+                for r in range(grid_n):
+                    for c in range(grid_n):
+                        patch = img.crop((c * pw, r * ph, (c + 1) * pw, (r + 1) * ph))
+                        tensor = classifier_transform(patch).unsqueeze(0).to(device)
+                        with torch.no_grad():
+                            prob = F.softmax(classifier_model(tensor), dim=1)[0, 1].item()
+                        patch_probs.append(prob)
+                scores.append(float(np.std(patch_probs)))
+            except Exception as e:
+                print(f"[경고] patch_variance 계산 실패: {p} ({e})")
+                scores.append(0.0)
+            if verbose and i % 200 == 0:
+                print(f"  patch_variance {i}/{n}")
+    else:
+        # 폴백: 학습된 분류기 없이 밝기 분산으로 근사
+        # (더러운 패널은 밝기가 불균일, 청소 중 사진은 한쪽이 밝고 한쪽이 어두움)
+        for i, p in enumerate(image_paths):
+            try:
+                import cv2 as _cv2
+                bgr = _to_cv2(p)
+                gray = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2GRAY)
+                ph, pw = gray.shape[0] // grid_n, gray.shape[1] // grid_n
+                patch_means = []
+                for r in range(grid_n):
+                    for c in range(grid_n):
+                        patch = gray[r*ph:(r+1)*ph, c*pw:(c+1)*pw]
+                        patch_means.append(float(patch.mean()))
+                scores.append(float(np.std(patch_means)))
+            except Exception as e:
+                print(f"[경고] patch_variance(fallback) 계산 실패: {p} ({e})")
+                scores.append(0.0)
+            if verbose and i % 200 == 0:
+                print(f"  patch_variance(fallback) {i}/{n}")
+
+    return np.array(scores)
+
+
+def compute_person_ratio_score(image_paths, device=None,
+                                score_threshold=0.7, batch_size=1,
+                                verbose=True):
+    """
+    Mask R-CNN(torchvision, COCO 사전학습)으로 'person' 클래스를 검출해
+    화면 전체 대비 사람이 차지하는 픽셀 비율을 반환.
+
+    - skin_ratio(HSV 피부색 근사)보다 훨씬 정확함
+    - 사람이 화면을 크게 차지하는 이미지(작업자 설치/청소 사진 등)를
+      ood_score에 직접 반영하는 용도
+
+    반환: (N,) 배열, 각 이미지의 person 픽셀 점유 비율(0~1)
+    """
+    import torch
+    from torchvision.models.detection import (
+        maskrcnn_resnet50_fpn, MaskRCNN_ResNet50_FPN_Weights
+    )
+    from torchvision import transforms as T
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    weights = MaskRCNN_ResNet50_FPN_Weights.DEFAULT
+    model = maskrcnn_resnet50_fpn(weights=weights)
+    model.eval().to(device)
+    transform = T.ToTensor()
+
+    # COCO 클래스 인덱스: person=1
+    PERSON_CLASS = 1
+
+    ratios = []
+    n = len(image_paths)
+    for i, p in enumerate(image_paths):
+        try:
+            img = Image.open(p).convert("RGB")
+            tensor = transform(img).to(device)
+            with torch.no_grad():
+                outputs = model([tensor])[0]
+
+            h, w = tensor.shape[1:]
+            total_pixels = h * w
+            person_mask = np.zeros((h, w), dtype=bool)
+
+            for j, (label, score) in enumerate(
+                zip(outputs["labels"], outputs["scores"])
+            ):
+                if label.item() == PERSON_CLASS and score.item() >= score_threshold:
+                    mask = outputs["masks"][j, 0].cpu().numpy() > 0.5
+                    person_mask |= mask
+
+            ratios.append(float(person_mask.sum() / total_pixels))
+        except Exception as e:
+            print(f"[경고] person_ratio 계산 실패: {p} ({e})")
+            ratios.append(0.0)
+        if verbose and i % 100 == 0:
+            print(f"  person_ratio {i}/{n}")
+
+    return np.array(ratios)
+
+
 def compute_ood_score_clip_prompts(image_paths, device=None, batch_size=32, verbose=True):
     """
     (선택적, CLIP 설치 시에만 사용 권장: pip install --break-system-packages -q git+https://github.com/openai/CLIP.git ftfy regex)
